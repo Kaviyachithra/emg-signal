@@ -1,0 +1,270 @@
+clc; 
+clear; 
+close all;
+%% Step 1: Load CSV dataset and Define Names
+disp('Step 1: Loading data...');
+filename = 'EMG-data.csv'; % Make sure this file is in your MATLAB path
+T = readtable(filename);
+% --- Define your 7 Gesture Names ---
+gestureNames = { ...
+    '1: Hand at Rest', ...
+    '2: Hand Clenched (Fist)', ...
+    '3: Wrist Flexion', ...
+    '4: Wrist Extension', ...
+    '5: Radial Deviations', ...
+    '6: Ulnar Deviations', ...
+    '7: Extended Palm'};
+% --- Read the correct columns ---
+data_cols = 2:9;     % Selects channel1 through channel8 (8 channels)
+label_col = 10;    % Selects the "class" column (Gestures 0-7)
+labels = T{:, label_col};
+data = T{:, data_cols};
+fs = 1000; % adjust sampling rate if known
+fprintf('Data loaded: %d samples × %d channels\n', size(data,1), size(data,2));
+%% Step 1.2: (NEW FIX) Remove Rows with Missing Data (NaN)
+disp('Step 1.2: Removing rows with missing (NaN) values...');
+% Find any row that has a NaN in ANY of its data columns
+nan_rows = any(isnan(data), 2);
+% Keep only the rows that are NOT NaN
+data = data(~nan_rows, :);
+labels = labels(~nan_rows, :);
+fprintf('Filtered NaN: %d samples remain (rows with NaN removed)\n', size(data,1));
+if isempty(data)
+    error('All data was NaN! Check your CSV file.');
+end
+%% Step 1.5: (CRITICAL FIX) Remove "Unmarked" Data (Class 0)
+disp('Step 1.5: Removing Class 0 (unmarked data)...');
+% Find all rows that are NOT Class 0
+valid_rows = (labels ~= 0); 
+% --- SAVE A COPY of the valid raw data for plotting ---
+rawData_valid = data(valid_rows, :); 
+% Keep only the valid rows for both data and labels
+data = data(valid_rows, :);
+labels = labels(valid_rows, :);
+fprintf('Filtered Class 0: %d samples remain (Class 0 removed)\n', size(data,1));
+disp('The unique GESTURE labels in this file are:');
+disp(unique(labels)); 
+%% Step 2: Filter
+disp('Step 2: Filtering data...');
+% Design a 4th order Butterworth bandpass filter from 20 Hz to 450 Hz.
+[b,a] = butter(4, [20 450]/(fs/2), 'bandpass');
+for i = 1:size(data,2)
+    % Use filtfilt for zero-phase filtering
+    data(:,i) = filtfilt(b,a,data(:,i));
+end
+%% Step 2.5: (FIXED) Plot "Wave for Each Step" (Raw vs. Filtered)
+disp('Step 2.5: Plotting signal processing example...');
+% --- Find an ACTIVE gesture (e.g., Class 2 = Fist) ---
+active_gesture = 2; 
+plot_duration = 500; % Plot 500 samples (500ms)
+% Find the first time this gesture appears in the filtered labels
+start_index = find(labels == active_gesture, 1, 'first');
+if isempty(start_index) || (start_index + plot_duration - 1) > size(data, 1)
+    warning('Could not find a long-enough segment for Gesture 2. Using default segment.');
+    plotSegment = 1001:(1001 + plot_duration - 1);
+    if plotSegment(end) > size(data,1)
+       plotSegment = 1:plot_duration; % Failsafe
+    end
+else
+    plotSegment = start_index : (start_index + plot_duration - 1);
+end
+% --------------------------------------------------------
+figure;
+sgtitle(sprintf('Processing Step Example (Gesture %d, Channel 1, %dms)', active_gesture, plot_duration));
+time_axis = (0:length(plotSegment)-1) / fs;
+% Plot 1: Raw Signal (before filtering)
+subplot(2,1,1);
+plot(time_axis, rawData_valid(plotSegment, 1));
+title('Raw Signal (before filtering)');
+ylabel('Amplitude (Volts)');
+grid on;
+% Plot 2: Filtered Signal (after filtering)
+subplot(2,1,2);
+plot(time_axis, data(plotSegment, 1));
+title('Filtered Signal (after filtering)');
+xlabel('Time (s)');
+ylabel('Amplitude (Volts)');
+grid on;
+%% Step 3: Segment and Feature Extraction (OPTIMIZED: Pre-allocated)
+disp('Step 3: Extracting features...');
+win_len = 200;   % Window length (e.g., 200ms)
+overlap = 100;   % Overlap between windows
+step = win_len - overlap; % Step size
+% --- PRE-ALLOCATION FOR EFFICIENCY ---
+n_samples = size(data, 1);
+if n_samples < win_len
+    error('Dataset too short (<200 samples) after cleaning. Cannot extract features.');
+end
+n_windows = floor((n_samples - win_len) / step) + 1;
+n_channels = size(data, 2);
+% 5 features per channel (MAV, RMS, ZC, SSC, WL)
+n_features = 5 * n_channels; 
+features = zeros(n_windows, n_features);
+targets = zeros(n_windows, 1);
+% ---------------------
+idx = 1;
+for i = 1:step:(n_samples - win_len + 1)
+    segment = data(i:i+win_len-1, :);
+    label = mode(labels(i:i+win_len-1));
+    feat = extract_features(segment); 
+    features(idx, :) = feat;
+    targets(idx, :) = label;
+    idx = idx + 1;
+end
+if idx-1 < n_windows
+    features = features(1:idx-1, :);
+    targets = targets(1:idx-1, :);
+end
+fprintf('Extracted %d feature vectors.\n', size(features,1));
+%% Step 4: Split data
+disp('Step 4: Splitting data into train/test sets...');
+% Create cross-validation partition object with 70% train, 30% test
+cv = cvpartition(targets, 'HoldOut', 0.3); 
+Xtrain = features(training(cv), :);
+Ytrain = targets(training(cv), :);
+Xtest = features(test(cv), :);
+Ytest = targets(test(cv), :);
+fprintf('Training set: %d samples\n', length(Ytrain));
+fprintf('Testing set: %d samples\n', length(Ytest));
+%% Step 5: Train SVM (Using Tuned RBF Kernel)
+disp('Step 5: Searching for Optimal RBF Kernel Scale for high accuracy...');
+% 1. Define a range of kernel scale values to test (logarithmic search)
+scaleCandidates = logspace(-2, 2, 20); % Test 20 scales from 0.01 to 100
+bestAccuracy = 0;
+bestScale = 'auto';
+% 2. Loop through candidates and evaluate using cross-validation on Xtrain
+for i = 1:length(scaleCandidates)
+    currentScale = scaleCandidates(i);
+    
+    % Define the SVM template with the current scale
+    t = templateSVM('KernelFunction', 'rbf', 'Standardize', true, 'KernelScale', currentScale);
+    
+    % Train ECOC model using cross-validation on the training set (5-fold)
+    cvModel = fitcecoc(Xtrain, Ytrain, 'Learners', t, 'Coding', 'onevsone', 'CrossVal', 'on', 'KFold', 5);
+    
+    % Calculate cross-validation loss (classification error)
+    cvError = kfoldLoss(cvModel);
+    cvAccuracy = 1 - cvError;
+    
+    % Update best scale if current scale is better
+    if cvAccuracy > bestAccuracy
+        bestAccuracy = cvAccuracy;
+        bestScale = currentScale;
+    end
+end
+% 3. Train the final model using the best found scale
+t_final = templateSVM('KernelFunction', 'rbf', 'Standardize', true, 'KernelScale', bestScale);
+svmModel = fitcecoc(Xtrain, Ytrain, 'Learners', t_final, 'Coding', 'onevsone');
+fprintf('Selected Optimal Kernel Scale: %.4f (Cross-Validation Accuracy: %.2f%%)\n', bestScale, bestAccuracy*100);
+disp('✅ SVM (Tuned RBF Kernel) trained successfully.');
+%% Step 6.0: Predict on Training Set
+disp('Step 6.0: Predicting on training set for evaluation...');
+YtrainPred = predict(svmModel, Xtrain);
+%% Step 6.1: Test Prediction
+disp('Step 6.1: Predicting on test set...');
+Ypred = predict(svmModel, Xtest);
+%% Step 6.2: Single Sample Prediction (Random Test)
+disp('Step 6.2: Predicting a random single test sample...');
+% This section provides the code for random testing as requested.
+% 1. Select a random index from the test set
+random_idx = randi(length(Ytest), 1);
+single_sample_features = Xtest(random_idx, :);
+actual_label = Ytest(random_idx);
+% 2. Predict the label for this single sample
+YsinglePred = predict(svmModel, single_sample_features);
+% 3. Look up the names (gesture names are 1-based, matching labels)
+actual_gesture_name = gestureNames{actual_label};
+predicted_gesture_name = gestureNames{YsinglePred};
+% 4. Display the output
+fprintf('\n--- Single Sample Prediction Test ---\n');
+fprintf('Random Sample Index in Test Set: %d\n', random_idx);
+fprintf('Actual Gesture (Label %d): %s\n', actual_label, actual_gesture_name);
+fprintf('Predicted Gesture (Label %d): %s\n', YsinglePred, predicted_gesture_name);
+if actual_label == YsinglePred
+    fprintf('Prediction Result: CORRECT\n');
+else
+    fprintf('Prediction Result: INCORRECT\n');
+end
+fprintf('-------------------------------------\n');
+%% Step 6.5: Plot "Wave for Each Class"
+disp('Step 6.5: Plotting example wave for each gesture...');
+figure;
+sgtitle('Waveforms for Each Gesture (Channel 1 Example)');
+plotLength = 400; % 400 samples (400ms)
+nGestures = length(gestureNames); % Should be 7
+for g = 1:nGestures
+    start_idx = find(labels == g, 1, 'first');
+    
+    if ~isempty(start_idx) && (start_idx + plotLength - 1 <= length(data))
+        segment = data(start_idx : start_idx + plotLength - 1, 1);
+        time_axis_g = (0:plotLength-1) / fs;
+        subplot(4, 2, g);
+        plot(time_axis_g, segment);
+        title(gestureNames{g});
+        ylabel('Amplitude');
+        xlabel('Time (s)');
+        grid on;
+    else
+        subplot(4, 2, g);
+        title([gestureNames{g} ' (No Data Found)']);
+    end
+end
+%% Step 7: Evaluate RESULTS (Training Set)
+disp('Step 7: Evaluating Training Set results...');
+% --- Overall Accuracy (Training) ---
+confMat_train = confusionmat(Ytrain, YtrainPred);
+accuracy_train = sum(diag(confMat_train)) / sum(confMat_train(:));
+fprintf('\n---  Overall Accuracy: %.2f%% ---\n', accuracy_train * 100);
+% --- Confusion Matrix (Training) ---
+figure; % Use a new figure for the training confusion matrix
+disp('Displaying named confusion matrix ..');
+active_classes = unique(targets);
+active_names = gestureNames(active_classes);
+confusionchart(confMat_train, active_names, ...
+    'Title', sprintf(' Confusion Matrix (Accuracy: %.2f%%)', accuracy_train*100), ...
+    'RowSummary', 'row-normalized', ...
+    'ColumnSummary', 'column-normalized');
+% --- Per-Class Accuracy (Training) ---
+disp('---  Per-Class Metrics ---');
+nClasses = size(confMat_train, 1);
+precision_train = zeros(nClasses, 1);
+recall_train = zeros(nClasses, 1);
+f1_score_train = zeros(nClasses, 1);
+classNames_table = active_names'; 
+for i = 1:nClasses
+    TP = confMat_train(i, i);
+    FP_col = sum(confMat_train(:, i)) - TP; 
+    precision_train(i) = TP / max(1, (TP + FP_col)); % Use max(1,...) to avoid division by zero
+    FN_row = sum(confMat_train(i, :)) - TP;
+    recall_train(i) = TP / max(1, (TP + FN_row));
+    f1_score_train(i) = 2 * (precision_train(i) * recall_train(i)) / max(eps, (precision_train(i) + recall_train(i)));
+end
+% Display in a table with names
+T_metrics_train = table(classNames_table, precision_train, recall_train, f1_score_train, 'VariableNames', {'Gesture', 'Precision', 'Recall', 'F1_Score'});
+disp(T_metrics_train);
+%% --- FUNCTION DEFINITION --- %%
+function feat = extract_features(seg)
+% EXTRACT_FEATURES calculates common time-domain EMG features for a given segment.
+    nCh = size(seg,2);
+    feat = [];
+    for ch = 1:nCh
+        x = seg(:,ch);
+        % 1. Mean Absolute Value (MAV)
+        MAV = mean(abs(x));
+        % 2. Root Mean Square (RMS)
+        RMS = sqrt(mean(x.^2));
+        % 3. Zero Crossings (ZC)
+        ZC = sum(abs(diff(x>0)));
+        % 4. Slope Sign Changes (SSC)
+        SSC = sum(diff(sign(diff(x)))~=0);
+        % 5. Waveform Length (WL)
+        WL = sum(abs(diff(x)));
+        
+        feat = [feat [MAV RMS ZC SSC WL]]; 
+    end
+end
+%% Step 6: SAVE THE MODEL AND PROCESSING PARAMETERS
+model_filename = 'emgsvmmodel.mat';
+disp(['Saving model and parameters to: ', model_filename]);
+save(model_filename, 'svmModel', 'b', 'a', 'win_len', 'overlap', 'gestureNames', 'fs');
+disp('--- Training Script Complete ---');
