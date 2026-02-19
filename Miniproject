@@ -116,6 +116,7 @@ if n_samples < win_len
 end
 n_windows = floor((n_samples - win_len) / step) + 1;
 n_channels = size(data, 2);
+
 % 5 features per channel (MAV, RMS, ZC, SSC, WL)
 n_features = 5 * n_channels; 
 features = zeros(n_windows, n_features);
