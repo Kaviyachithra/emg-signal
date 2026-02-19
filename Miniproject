@@ -3,7 +3,6 @@ clear;
 close all;
 
 %% Step 1: Load CSV dataset and Define Names
-
 disp('Step 1: Loading data...');
 filename = 'EMG-data.csv'; % Make sure this file is in your MATLAB path
 T = readtable(filename);
